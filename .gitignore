@@ -1,0 +1,4 @@
+.venv/
+crawls/
+wines.jsonl
+out.log
