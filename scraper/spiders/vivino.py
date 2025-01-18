@@ -9,9 +9,8 @@ from scrapy.exceptions import DropItem
 from scrapy.http import Response
 
 BASE_URL = "https://www.vivino.com/api"
-MAX_PAGES = 60  # warn for any searches with more than this number of pages of results
-# https www.vivino.com/api/grapes  "User-Agent:"   Accept:application/json | jq '[.grapes[].id]'
 OUT_FILE = "wines.jsonl"
+MAX_PAGES = 60
 MAX_PRICE = 2000
 
 
@@ -63,14 +62,14 @@ class VivinoSpider(scrapy.Spider):
         self.price_range = {}
         self.state = {}
 
-    def start_requests(self) -> Iterable[Request]:
+    def start_requests(self):
         yield Request(
             url=f"{BASE_URL}/grapes",
             callback=self.on_grapes,
             dont_filter=True,
         )
 
-    def on_grapes(self, response: Response, **kwargs: Any) -> Any:
+    def on_grapes(self, response: Response, **kwargs: Any):
         data = response.json()
         grapes = data['grapes']
         self.logger.info("Found %d grapes", len(grapes))
@@ -112,7 +111,7 @@ class VivinoSpider(scrapy.Spider):
             dont_filter=True,
         )
 
-    def on_compute_filterset(self, response: Response, **kwargs: Any) -> Any:
+    def on_compute_filterset(self, response: Response, **kwargs: Any):
         grape_id = kwargs['grape_id']
         min_price = kwargs['min_price']
         max_price = kwargs['max_price']
@@ -163,7 +162,7 @@ class VivinoSpider(scrapy.Spider):
             dont_filter=True,
         )
 
-    def on_explore(self, response: Response, **kwargs: Any) -> Any:
+    def on_explore(self, response: Response, **kwargs: Any):
         grape_id = kwargs['grape_id']
         min_price = kwargs['min_price']
         max_price = kwargs['max_price']
