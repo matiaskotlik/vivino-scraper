@@ -1,3 +1,4 @@
+import pprint
 from math import ceil
 from typing import Iterable, Any
 from urllib.parse import urlencode
@@ -9,15 +10,17 @@ from scrapy.exceptions import DropItem
 from scrapy.http import Response
 
 BASE_URL = "https://www.vivino.com/api"
+BUCKET = "trade_vino_data"
+BUCKET_PREFIX = "vivino-images"
 OUT_FILE = "wines.jsonl"
 MAX_PAGES = 60
-MAX_PRICE = 2000
+MAX_PRICE = 10000
 
 
 class NoImagePipeline:
     def process_item(self, item, spider):
         if not item["image_urls"]:
-            raise DropItem(f"No images found for item: {item['id']}")
+            raise DropItem(f"No images found for item: {item['vintage_id']}")
         return item
 
 
@@ -25,22 +28,30 @@ class DeduplicatePipeline:
     def __init__(self):
         try:
             with jsonlines.open(OUT_FILE) as wines:
-                self.seen = set(wine["id"] for wine in wines)
+                self.seen = set(wine["vintage_id"] for wine in wines)
         except FileNotFoundError:
             self.seen = set()
 
     def process_item(self, item, spider):
-        if item["id"] in self.seen:
-            raise DropItem(f"Duplicate item found: {item['id']}")
-        self.seen.add(item["id"])
+        if item["vintage_id"] in self.seen:
+            raise DropItem(f"Duplicate item found: {item['vintage_id']}")
+        self.seen.add(item["vintage_id"])
         return item
 
+class FixLabelPipeline:
+    def process_item(self, item, spider):
+        image_path = item["images"][0]['path']
+        bucket_path = f"https://storage.cloud.google.com/{BUCKET}/{BUCKET_PREFIX}"
+        item["vintage_label_image_url"] = f'{bucket_path}/{image_path}'
+        del item["image_urls"]
+        del item["images"]
+        return item
 
 class VivinoSpider(scrapy.Spider):
     name = "vivino"
     allowed_domains = ["vivino.com"]
     custom_settings = {
-        "IMAGES_STORE": "gs://trade_vino_data/vivino-images/",
+        "IMAGES_STORE": f"gs://{BUCKET}/{BUCKET_PREFIX}/",
         "DEFAULT_REQUEST_HEADERS": {
             "Accept": "application/json",
         },
@@ -48,6 +59,7 @@ class VivinoSpider(scrapy.Spider):
             NoImagePipeline: 200,
             DeduplicatePipeline: 300,
             "scrapy.pipelines.images.ImagesPipeline": 500,
+            FixLabelPipeline: 501,
         },
         "FEEDS": {
             OUT_FILE: {
@@ -73,22 +85,28 @@ class VivinoSpider(scrapy.Spider):
         data = response.json()
         grapes = data['grapes']
         self.logger.info("Found %d grapes", len(grapes))
-        # for grape in grapes:
-        for grape in grapes[:3]:
+        for grape in grapes:
             # get current page for this grape
             grape_id = grape['id']
             yield from self.build_compute_filterset(grape_id)
 
-    def build_compute_filterset(self, grape_id: int, min_price: float = 0, spread: float = -1):
+    def build_compute_filterset(self, grape_id: int, min_price: float = -1, spread: float = -1):
+        if min_price >= MAX_PRICE:
+            self.logger.info("Max price ($%d) reached for grape %d, we will stop.", MAX_PRICE, grape_id)
+            return
+
+        if min_price == -1:
+            min_price = self.state.setdefault('min_price', {}).setdefault(grape_id, 0.0)
+
         if spread == -1:
-            default_spread = 1.05 ** min_price
+            max_spread = MAX_PRICE - min_price
+            default_spread = min(max_spread, max(1.13 ** min_price, 12))
             # try to retrieve spread from state
             spread = self.state.get('spread', {}).get(grape_id, {}).get(min_price, default_spread)
 
         max_price = min_price + spread
-        if max_price > MAX_PRICE:
-            self.logger.info("Max price ($%d) reached for grape %d, we will stop.", MAX_PRICE, grape_id)
-            return
+
+        page = self.state.get('current_page', {}).get(grape_id, {}).get((min_price, max_price), 1)
 
         params = {
             "min_rating": 0,
@@ -96,7 +114,7 @@ class VivinoSpider(scrapy.Spider):
             "price_range_max": max_price,
             "grape_ids[]": grape_id,
             "order_by": "ratings_count",
-            "page": 1,
+            "page": page,
         }
         yield Request(
             url=f"{BASE_URL}/explore/explore?{urlencode(params)}",
@@ -105,7 +123,7 @@ class VivinoSpider(scrapy.Spider):
                 "min_price": min_price,
                 "max_price": max_price,
                 "spread": spread,
-                "page": 1,
+                "page": page,
             },
             callback=self.on_compute_filterset,
             dont_filter=True,
@@ -125,8 +143,9 @@ class VivinoSpider(scrapy.Spider):
         self.logger.info("Current filters for grape %d: $%d-$%d (%d results)", grape_id, min_price, max_price, records)
 
         if not wines:
-            self.logger.info("No results between $%d and $%d for grape %d, we will double the spread.", min_price, max_price, grape_id)
-            yield from self.build_compute_filterset(grape_id, min_price, spread * 2)
+            self.logger.info("No results between $%d and $%d for grape %d, we will increase the minimum price.", min_price, max_price, grape_id)
+            new_min_price = self.state.setdefault('min_price', {})[grape_id] = max_price + 0.01
+            yield from self.build_compute_filterset(grape_id, new_min_price)
             return
 
         records_in_page = len(wines)
@@ -197,16 +216,60 @@ class VivinoSpider(scrapy.Spider):
                 label_image_url = f"https://{label_image_url[2:]}"
                 image_urls = [label_image_url]
             except KeyError:
-                image_urls = []
+                self.logger.debug("No label image found for wine %d, skipping", wine['vintage']['id'])
+                continue
+
+            if not wine['vintage']['wine']:
+                continue
+
+            if not wine['vintage']['wine']['style']:
+                wine['vintage']['wine']['style'] = {}
+
+            if not wine['vintage']['wine']['region']:
+                wine['vintage']['wine']['region'] = {}
+
+            if not wine['vintage']['wine']['winery']:
+                wine['vintage']['wine']['winery'] = {}
+
+            wine_id = wine['vintage']['wine']['id']
+            vintage_year = wine['vintage']['year']
 
             yield {
-                "id": wine['vintage']['id'],
-                "url": f"{BASE_URL}/w/{wine['vintage']['wine']['id']}",
-                "winery": wine['vintage']['wine']['winery']['name'],
-                "region": wine['vintage']['wine']['region']['name'],
-                "name": wine['vintage']['name'],
-                "year": wine['vintage']['year'],
                 "image_urls": image_urls,
+                "vintage_id": wine['vintage']['id'],
+                "vintage_url": f'https://www.vivino.com/api/w/{wine_id}?year={vintage_year}',
+                "vintage_seo_name": wine['vintage']['seo_name'],
+                "vintage_name": wine['vintage']['name'],
+                "vintage_year": vintage_year,
+                "wine_id": wine_id,
+                "wine_url": f'https://www.vivino.com/api/wine/{wine_id}',
+                "wine_name": wine['vintage']['wine']['name'],
+                "wine_seo_name": wine['vintage']['wine']['seo_name'],
+                "wine_type_id": wine['vintage']['wine']['type_id'],
+                "wine_vintage_type": wine['vintage']['wine']['vintage_type'],
+                "wine_is_natural": wine['vintage']['wine']['is_natural'],
+                "wine_region_id": wine['vintage']['wine']['region'].get('id'),
+                "wine_region_name": wine['vintage']['wine']['region'].get('name'),
+                "wine_region_name_en": wine['vintage']['wine']['region'].get('name_en'),
+                "wine_region_seo_name": wine['vintage']['wine']['region'].get('seo_name'),
+                "wine_region_country_code": wine['vintage']['wine']['region'].get('country', {}).get('code'),
+                "wine_region_country_name": wine['vintage']['wine']['region'].get('country', {}).get('name'),
+                "wine_region_country_native_name": wine['vintage']['wine']['region'].get('country', {}).get('native_name'),
+                "wine_region_country_seo_name": wine['vintage']['wine']['region'].get('country', {}).get('seo_name'),
+                "style_id": wine['vintage']['wine']['style'].get('id'),
+                "style_name": wine['vintage']['wine']['style'].get('name'),
+                "style_regional_name": wine['vintage']['wine']['style'].get('regional_name'),
+                "style_varietal_name": wine['vintage']['wine']['style'].get('varietal_name'),
+                "style_seo_name": wine['vintage']['wine']['style'].get('seo_name'),
+                "style_description": wine['vintage']['wine']['style'].get('description'),
+                "style_body": wine['vintage']['wine']['style'].get('body'),
+                "style_body_description": wine['vintage']['wine']['style'].get('body_description'),
+                "style_acidity": wine['vintage']['wine']['style'].get('acidity'),
+                "style_acidity_description": wine['vintage']['wine']['style'].get('acidity_description'),
+                "winery_id": wine['vintage']['wine']['winery'].get('id'),
+                "winery_name": wine['vintage']['wine']['winery'].get('name'),
+                "winery_seo_name": wine['vintage']['wine']['winery'].get('seo_name'),
+                "taste": wine['vintage']['wine']['taste'],
             }
 
         self.state.setdefault('current_page', {}).setdefault(grape_id, {})[(min_price, max_price)] = page
